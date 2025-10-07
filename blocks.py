@@ -14,7 +14,7 @@ class MultiHeadAttention(nn.Module):
         self.W_queries = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_values = nn.Linear(d_in, d_out, bias=qkv_bias)
     
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         b, n_tokens, dim = x.shape
         # Step 1: Calculate keys, queries, values for batch
         keys = self.W_keys(x)
@@ -30,14 +30,17 @@ class MultiHeadAttention(nn.Module):
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
 
-        attn_scores = keys @ queries.transpose(-1, -2)
+        attn_scores = queries @ keys.transpose(-1, -2)
+        subsequent_mask = torch.tril(torch.ones(n_tokens, n_tokens), diagonal=0)
+        attn_scores.masked_fill_(subsequent_mask == 0, -torch.inf) # mask subsequent tokens
+        if attn_mask is not None: # mask padded tokens
+            attn_scores.masked_fill_(~attn_mask, -torch.inf)
         weight_scores = torch.softmax(attn_scores, dim=-1)
 
-        weighted_sum = weight_scores @ keys
+        weighted_sum = weight_scores @ values
 
         weighted_sum = weighted_sum.reshape(b, n_tokens, -1)
         return weighted_sum
-
 class FFN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -62,15 +65,19 @@ class InputPreprocess(nn.Module):
         self.embedding_layer = nn.Embedding(n_vocab, n_dim)
         self.pos_embedding_layer = nn.Embedding(n_context, n_dim)
     
-    def forward(self, x):
-        ids = self.tokenizer.encode(x)
-        length = len(ids)
+    def forward(self, example_list):
+        ids = [self.tokenizer.encode(example) for example in example_list]
+        max_length = max(len(id) for id in ids)
+        attn_mask = [[1] * len(id) + [0] * (max_length - len(id)) for id in ids]
+        attn_mask = torch.tensor(attn_mask, dtype=torch.bool)
+        ids = [id + [0] * (max_length - len(id)) for id in ids]
         ids = torch.tensor(ids, dtype=torch.long) # change to torch tensor for compapility
+        attn_mask = attn_mask.reshape(ids.size(0), 1, 1, max_length)
 
         embd_vecs = self.embedding_layer(ids)
-        pos_embd_vecs = self.pos_embedding_layer(torch.arange(length))
+        pos_embd_vecs = self.pos_embedding_layer(torch.arange(max_length)).unsqueeze(0)
 
-        return (embd_vecs + pos_embd_vecs).unsqueeze(0)
+        return embd_vecs + pos_embd_vecs, attn_mask
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -84,10 +91,10 @@ class TransformerBlock(nn.Module):
         self.ffn = FFN(cfg)
         self.drop2 = nn.Dropout(cfg['embd_pdrop'])
     
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         x_pre = x
         x_p1 = self.layer_norm1(x)
-        x_p1 = self.mhma(x_p1)
+        x_p1 = self.mhma(x_p1, attn_mask)
         x_p1 = self.drop1(x_p1)
         x_p1 = x_pre + x_p1
         x_p2 = self.layer_norm2(x_p1)
